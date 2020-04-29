@@ -6,6 +6,7 @@ from keras.optimizers import Adam
 import numpy as np
 import cv2
 from datetime import datetime
+import time
 
 
 # Prevent TensorFlow from allocating the entire GPU at the start of the program.
@@ -22,17 +23,19 @@ def get_image(client):
     response = client.simGetImages([airsim.ImageRequest('0', airsim.ImageType.Scene, False, False)])[0]
     img1d = np.frombuffer(response.image_data_uint8, dtype=np.uint8) 
     img_rgba = img1d.reshape(response.height, response.width, 3)
-    return cv2.resize(img_rgba[75:135,0:255,:],(130,45))
+    # return cv2.resize(img_rgba[75:135,0:255,:],(130,45))
+    # return cv2.resize(img_rgba[70:140,0:255,:],(70,70))
+    return cv2.resize(img_rgba, (86,86))
 
 
 def build_dnn(number_of_actions, input_dims):
     model = Sequential()
-    model.add(Conv2D(128, kernel_size=3, activation='relu', input_shape=input_dims))
+    model.add(Conv2D(64, kernel_size=8, activation='relu', input_shape=input_dims))
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Conv2D(128, kernel_size=4, activation='relu'))
     model.add(MaxPooling2D(pool_size=(2,2)))
     model.add(Conv2D(64, kernel_size=3, activation='relu'))
-    model.add(MaxPooling2D(pool_size=(2,2)))
-    model.add(Conv2D(64, kernel_size=3, activation='relu'))
-    model.add(MaxPooling2D(pool_size=(2,2)))
+    # model.add(MaxPooling2D(pool_size=(2,2)))
     model.add(Dropout(0.15))
     model.add(Flatten())
     model.add(Dense(128))
@@ -44,7 +47,7 @@ def build_dnn(number_of_actions, input_dims):
     return model
 
 def save_model(model):
-    model.save('ddqn_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.h5')
+    model.model.save('ddqn_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.h5')
 
 def update_network_parameters(model, weights):
     model.model.set_weights(weights)
@@ -96,7 +99,6 @@ class RandomExploration(object):
         # choose if action will be random
         if rand < self.epsilon:
             ret = True
-            print('Random action selected. epsilon : ' + str(self.epsilon))
 
         # declining epsilon
         if self.epsilon > self.epsilon_min:
@@ -107,7 +109,7 @@ class RandomExploration(object):
         return ret
 
 
-# Uciraju se kordinate (rucno mereni poceci puta preko pozicije kola u simulatoru)
+# Ucitaju se kordinate (rucno mereni poceci puta preko pozicije kola u simulatoru)
 def init_road_points():
     road_points = []
     with open('road_points.txt', 'r') as f:
@@ -129,11 +131,10 @@ def get_reward(car_state, road_points):
         d = min(d, dist)
 
     if car_state.speed > 0.1:
-        print('log distance : ' + str(d))
-        print('log distance factor : ' + str(np.exp(-d*1.3)))
-        return np.log(car_state.speed)*np.exp(-d+0.5)*1.5
+        print('distance : ', d, '\texp distance factor : ', np.exp(-d*0.3), '\tlog car speed : ', np.log(car_state.speed+1))
+        return np.log(car_state.speed+1)*np.exp(-d*0.3)*3
     else:
-        return -100
+        return 0
 
 
 # # Parametar options
@@ -147,18 +148,18 @@ def get_reward(car_state, road_points):
 # replace_target = 100              # na koliko se menjaju tezine u target mrezi
 # memory_size = 100000              # velicina buffera
 class Agent(object):
-    def __init__(self, number_of_actions = 6, epsilon = 0.9999, batch_size = 128, input_dims = (45, 130, 3),   
-            gamma = 0.9, epsilon_dec_rate = 0.99, epsilon_end = 0.1, memory_size = 100000, replace_target = 100):
+    def __init__(self, number_of_actions = 6, epsilon = 0.9999, batch_size = 64, input_dims = (45, 130, 3),   
+            gamma = 0.9, epsilon_dec_rate = 0.99, epsilon_end = 0.5, memory_size = 10000, replace_target = 300):
         self.number_of_actions = number_of_actions
         self.batch_size = batch_size
         self.gamma = gamma
         self.replace_target = replace_target
         self.rand = RandomExploration(epsilon, epsilon_dec_rate, epsilon_end)
         self.memory = ReplayBuffer(memory_size, input_dims)
-        self.policy = build_dnn(number_of_actions, input_dims)
-        self.target = build_dnn(number_of_actions, input_dims)
-        # self.policy = load_model('ddqn_20200401_171854.h5')
-        # self.target = load_model('ddqn_20200401_171854.h5')
+        # self.policy = build_dnn(number_of_actions, input_dims)
+        # self.target = build_dnn(number_of_actions, input_dims)
+        self.policy = load_model('ddqn_20200429_015522.h5')
+        self.target = load_model('ddqn_20200429_015522.h5')
 
     # https://arxiv.org/pdf/1509.06461.pdf
     def learn(self):
@@ -186,6 +187,17 @@ class Agent(object):
             self.target.model.set_weights(self.policy.model.get_weights())
             save_model(self.policy)
 
+        if self.memory.mem_cntr % 500 == 0:
+            client.simPause(True)
+            states, actions, rewards, new_states = self.memory.sample_buffer(500)
+            max_actions = np.argmax(self.policy.predict(new_states), axis=1)
+            batch_index = np.arange(500, dtype=np.uint8)
+            q_target_val = self.target.predict(new_states)
+            q_target_val = q_target_val[batch_index, max_actions]
+            q_policy_val = self.policy.predict(states)
+            q_policy_val[batch_index, max_actions] = rewards + self.gamma * q_target_val  
+            _ = self.policy.fit(states, q_policy_val, epochs=50, verbose=1)
+            client.simPause(False)
 
 def interpret_action(action):
     car_controls.throttle = 1
@@ -219,17 +231,17 @@ client.enableApiControl(True)
 car_controls = airsim.CarControls()
 
 curent_state = get_image(client)
-agent = Agent()
+agent = Agent(input_dims=curent_state.shape)
 
 while True:
     # getting reward for given state
     car_state = client.getCarState()
     reward = get_reward(car_state, road_points) 
-    print('Reward : ' + str(reward))
-
+  
     # action selection
     action = np.random.randint(agent.number_of_actions)
-    if not agent.rand.choose_random():
+    rand_action = agent.rand.choose_random()
+    if not rand_action:
         action = agent.policy.predict(curent_state.reshape(1, *curent_state.shape))
         action = np.argmax(action)
 
@@ -237,6 +249,10 @@ while True:
     car_controls = interpret_action(action)
     client.setCarControls(car_controls)
 
+    if rand_action:
+        print('Reward: ', reward, '\t Action: ', action, '\t Random action, epsilon: ', agent.rand.epsilon)
+    else:
+        print('Reward: ', reward, '\t Action: ', action, '\t Choosen action')
     # getting new state
     new_state = get_image(client)
 
@@ -246,12 +262,13 @@ while True:
     # check if in new_state there is collision, if so we reset car and give huge negativ reward
     collision_info = client.simGetCollisionInfo()
     if collision_info.has_collided:
-        agent.memory.store_transition(new_state, action, -1000000, new_state)
+        agent.memory.store_transition(new_state, action, -100, new_state)
         client.reset()
-        car_controls.brake = 0
-        car_controls.throttle = 0
-        car_controls.steering = 0
+        # car_controls.brake = 0
+        car_controls.throttle = 1
+        # car_controls.steering = 0
         client.setCarControls(car_controls)
+        time.sleep(0.5)
 
     agent.learn()
     curent_state = new_state
